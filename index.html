@@ -27,6 +27,8 @@
   #screen { width: 100%; aspect-ratio: 32 / 20; display: block; background: #000; border-radius: 10px; touch-action: none; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
   .row > button { flex: 1 1 0; white-space: nowrap; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+  .grid > button { padding: 10px 6px; white-space: nowrap; }
   label { display: flex; align-items: center; gap: 10px; margin-top: 14px; font-size: 14px; color: var(--dim); }
   input[type=range] { flex: 1; accent-color: var(--led); height: 32px; }
   input[type=text] { flex: 3 1 0; min-width: 0; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-height: 44px; }
@@ -44,7 +46,7 @@
 
 <canvas id="screen"></canvas>
 
-<h2>그리기</h2>
+<h2>그림판</h2>
 <div class="row">
   <button id="pen" class="on">펜</button>
   <button id="eraser">지우개</button>
@@ -52,8 +54,8 @@
   <button id="invert">반전</button>
 </div>
 
-<h2>움직이는 화면</h2>
-<div class="row">
+<h2>애니메이션</h2>
+<div class="grid" id="anims">
   <button data-demo="ball">공</button>
   <button data-demo="rain">비</button>
   <button data-demo="ripple">물결</button>
@@ -61,10 +63,7 @@
   <button data-demo="sound">소리 반응</button>
 </div>
 
-<h2>저장된 그림 (tag 가 직접 재생)</h2>
-<div class="row" id="sheets"></div>
-
-<h2>글자 띄우기</h2>
+<h2>전광판</h2>
 <div class="row">
   <input id="msg" type="text" value="SKAICHIPS 안녕하세요" maxlength="80" placeholder="띄울 문구" enterkeyhint="go">
   <button data-demo="text">띄우기</button>
@@ -284,11 +283,13 @@ function startSheet(s) {
   demoTimer = setInterval(run, 100);        // the sheets are drawn for 10 frames a second
   if (ch) askSheet(s);
 }
+// One list for the user: the stored animations first, then the ones the page computes
+const firstDemo = $('anims').firstElementChild;
 for (const s of SHEETS) {
   const b = document.createElement('button');
   b.textContent = s.label; b.dataset.sheet = s.id;
   b.onclick = () => sheet === s ? stopDemo() : startSheet(s);
-  $('sheets').appendChild(b);
+  $('anims').insertBefore(b, firstDemo);
 }
 
 /* ---------- Bluetooth ---------- */
@@ -329,14 +330,14 @@ async function pump() {
 function onNotify(e) {
   const d = e.target.value, id = d.getUint16(0);
   if (id === CMD_ACK && d.byteLength >= 14) tagStat = `tag: 받음 ${d.getUint32(2, true)}, 표시 ${d.getUint32(6, true)}, 실패 ${d.getUint32(10, true)}`;
-  else if (id === CMD_AVAIL_ACK && sheet) say('tag 가 저장된 그림을 재생 중: ' + sheet.label);
+  else if (id === CMD_AVAIL_ACK && sheet) say('재생 중: ' + sheet.label);
   else if (id === CMD_SHOWN && sheet) {
     // it is the sheet the tag had up before the live screen: leaving the live screen brings it back
     op(() => ch.writeValueWithResponse(cmd(CMD_LIVE, 0)));
-    say('tag 가 저장된 그림을 재생 중: ' + sheet.label);
+    say('재생 중: ' + sheet.label);
   } else if (id === CMD_REQ && sheet) {
     sheetStream = true; mute = false;       // not built into this tag: the page sends the frames
-    say('tag 에 없는 그림이라 폰에서 보내는 중: ' + sheet.label);
+    say('재생 중: ' + sheet.label);
   }
   else if (id === CMD_ERR) say('tag 가 명령을 거부함 (실시간 모드가 없는 펌웨어일 수 있음)', true);
 }
