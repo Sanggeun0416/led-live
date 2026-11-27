@@ -63,7 +63,7 @@
   <button data-demo="sound">소리 반응</button>
 </div>
 
-<h2>전광판</h2>
+<h2>전광판 <span id="msgn"></span></h2>
 <div class="row">
   <input id="msg" type="text" value="SKAICHIPS 안녕하세요" maxlength="80" placeholder="띄울 문구" enterkeyhint="go">
   <button data-demo="text">띄우기</button>
@@ -94,18 +94,62 @@ let sceneNext = false, blendWant = 0, blendSent = -1;   // the next frame opens 
 let sheet = null, sheetStream = false, mute = false;   // a stored animation is selected / the page has to send it / nothing is sent
 
 /* ---------- screen ---------- */
-function paint() {
+// The preview shows what the matrix shows: `shown` follows fb the way the tag does it, with the crossfade
+// between frames (mixMs, the time sent with LIVE_SET) and the fade through the dark at a scene change
+// (the tag's OEPL_LED_FADE_OUT_MS / _IN_MS, squared ramps)
+const FADE_OUT_MS = 300, FADE_IN_MS = 500;
+const shown = new Float32Array(W * H);
+let gain = 1, fade = null, fadeT0 = 0, fadeFrom = 1, snapNext = false;
+let mixMs = 0, mixEnd = 0, lastTick = performance.now(), drawn = false;
+
+function draw() {
   const dpr = window.devicePixelRatio || 1, cw = cv.clientWidth, chh = cv.clientHeight;
   if (cv.width !== Math.round(cw * dpr)) { cv.width = Math.round(cw * dpr); cv.height = Math.round(chh * dpr); }
   const s = cv.width / W, r = s * 0.36;
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height);
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    const v = fb[y * W + x];
-    ctx.fillStyle = v ? `rgba(255,179,0,${0.25 + 0.75 * v / TOP})` : '#2a2620';
+    const v = Math.max(0, Math.min(1, shown[y * W + x] / TOP * gain));
+    // from the colour of an unlit LED to full amber
+    ctx.fillStyle = `rgb(${Math.round(42 + 213 * v)},${Math.round(38 + 141 * v)},${Math.round(32 - 32 * v)})`;
     ctx.beginPath(); ctx.arc((x + .5) * s, (y + .5) * s, r, 0, 6.2832); ctx.fill();
   }
 }
-function changed() { paint(); dirty = true; pump(); }
+/// fb has a new frame: it is mixed in over mixMs, or goes up at once
+function touch() {
+  if (snapNext) { shown.set(fb); snapNext = false; }
+  mixEnd = performance.now() + mixMs; drawn = false;
+}
+/// A new scene: what is up dims out, the newest frame is taken in the dark and comes in
+function sceneFade() {
+  const now = performance.now();
+  if (fade === 'out') return;
+  if (gain > 0.02 && shown.some(v => v > 0.5)) { fade = 'out'; fadeFrom = gain; }
+  else { fade = 'in'; gain = 0; snapNext = true; }
+  fadeT0 = now;
+}
+function tick(now) {
+  const dt = Math.min(100, now - lastTick); lastTick = now;
+  let moving = false;
+  if (fade === 'out') {                     // the old scene stays as it is while it dims
+    const u = 1 - (now - fadeT0) / FADE_OUT_MS;
+    if (u <= 0) { gain = 0; shown.set(fb); fade = 'in'; fadeT0 = now; } else gain = fadeFrom * u * u;
+    moving = true;
+  } else {
+    if (fade === 'in') {
+      const u = (now - fadeT0) / FADE_IN_MS;
+      if (u >= 1) { gain = 1; fade = null; } else gain = u * u;
+      moving = true;
+    }
+    if (mixMs > 0 && now < mixEnd) {
+      const a = Math.min(1, dt / (mixEnd - now + dt));
+      for (let i = 0; i < shown.length; i++) shown[i] += (fb[i] - shown[i]) * a;
+      moving = true;
+    } else if (!drawn) shown.set(fb);
+  }
+  if (moving || !drawn) { draw(); drawn = !moving; }
+  requestAnimationFrame(tick);
+}
+function changed() { touch(); dirty = true; pump(); }
 
 /* ---------- drawing with a finger ---------- */
 let last = null;
@@ -233,6 +277,7 @@ async function startDemo(name) {
   // the tag does for its own sheets, so every animation changes and moves the same way
   sceneNext = true;
   blendWant = demos[name].blend || demos[name].ms;
+  sceneFade(); mixMs = blendWant;
   document.querySelectorAll('[data-demo]').forEach(b => b.classList.toggle('on', b.dataset.demo === name));
   let n = 0;
   const run = () => { demos[name].step(n++); changed(); };
@@ -243,9 +288,13 @@ function stopDemo() {
   if (demoTimer) clearInterval(demoTimer);
   demoTimer = null; demo = null; sheet = null; sheetStream = false; mute = false;
   blendWant = 0;                            // a finger drawing goes up at once
+  mixMs = 0; fade = null; gain = 1; snapNext = false;
   document.querySelectorAll('[data-demo], [data-sheet]').forEach(b => b.classList.remove('on'));
 }
 $('msg').addEventListener('keydown', e => { if (e.key === 'Enter') startDemo('text'); });
+const countMsg = () => { $('msgn').textContent = `(${$('msg').value.length} / ${$('msg').maxLength}자)`; };
+$('msg').addEventListener('input', countMsg);
+countMsg();
 $('slower').onclick = () => { textStep = Math.max(1, textStep - 1); };
 $('faster').onclick = () => { textStep = Math.min(4, textStep + 1); };
 document.querySelectorAll('[data-demo]').forEach(b => { b.onclick = () => demo === b.dataset.demo ? stopDemo() : startDemo(b.dataset.demo); });
@@ -283,9 +332,10 @@ function askSheet(s) {
 function startSheet(s) {
   stopDemo();
   sheet = s; mute = true; dirty = false;
+  sceneFade(); mixMs = 100;                 // as the tag shows it: 10 frames a second, mixed
   document.querySelectorAll('[data-sheet]').forEach(b => b.classList.toggle('on', b.dataset.sheet === s.id));
   let n = 0;
-  const run = () => { sheetFrame(s, n++); if (sheetStream) changed(); else paint(); };
+  const run = () => { sheetFrame(s, n++); if (sheetStream) changed(); else touch(); };
   run();
   demoTimer = setInterval(run, 100);        // the sheets are drawn for 10 frames a second
   if (ch) askSheet(s);
@@ -404,14 +454,15 @@ function setLevel() {
 $('level').onchange = setLevel;
 $('level').oninput = () => { $('levelv').textContent = $('level').value; };
 
-// Frames a second right now: what went out over the last second. A stored animation is played by the tag
-// itself, which redraws the matrix 60 times a second (its crossfade), so that is the figure shown for it.
+// How often the matrix is redrawn. An animation is mixed by the tag, its own sheet (10 frames a second) and
+// the frames sent from here (about 20) alike, at 60 redraws a second; a drawing is redrawn as often as a
+// frame goes out, which is what was sent over the last second.
 setInterval(() => {
   const fps = sent - sentAt; sentAt = sent;
-  $('stat').textContent = 'FPS ' + (!ch ? '-' : sheet && !sheetStream ? 60 : fps);
+  $('stat').textContent = 'FPS ' + (!ch ? '-' : (sheet && !sheetStream) || blendWant > 0 ? 60 : fps);
 }, 1000);
-window.addEventListener('resize', paint);
-paint();
+window.addEventListener('resize', () => { drawn = false; });
+requestAnimationFrame(tick);
 </script>
 </body>
 </html>
