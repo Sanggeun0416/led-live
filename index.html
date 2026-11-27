@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>LED Live</title>
+<!--
+  Live screen of the 32x20 LED tag from a phone (Web Bluetooth: Chrome on Android or on a PC).
+  The page writes whole frames to the tag's 0x1337 characteristic with BLE_CMD_LED_LIVE (0xE2,
+  src/main/oepl_proto.h): 1 bit a pixel when the frame is only on / off (one write of 84 bytes),
+  4 bits a pixel otherwise (two writes). One file, no libraries: copy it to the phone and open it in Chrome.
+-->
+<style>
+  :root { --bg: #101114; --panel: #1b1d22; --line: #2c2f36; --text: #e9e6df; --dim: #9a968c; --led: #ffb300; --off: #2a2620; --warn: #ff6b5e; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.4 system-ui, "Malgun Gothic", sans-serif; }
+  body { padding: 12px 16px 24px; max-width: 720px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  h1 { font-size: 18px; margin: 0; flex: 1; font-weight: 600; }
+  button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; min-height: 44px; }
+  button:active { background: #262930; }
+  button.on { border-color: var(--led); color: var(--led); }
+  button.main { background: var(--led); color: #1a1300; border-color: var(--led); font-weight: 600; }
+  button:disabled { opacity: .45; }
+  #status { font-size: 13px; color: var(--dim); min-height: 20px; margin: 6px 0 10px; }
+  #status.err { color: var(--warn); }
+  #screen { width: 100%; aspect-ratio: 32 / 20; display: block; background: #000; border-radius: 10px; touch-action: none; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .row > button { flex: 1 1 0; white-space: nowrap; }
+  label { display: flex; align-items: center; gap: 10px; margin-top: 14px; font-size: 14px; color: var(--dim); }
+  input[type=range] { flex: 1; accent-color: var(--led); height: 32px; }
+  h2 { font-size: 13px; color: var(--dim); font-weight: 500; margin: 18px 0 0; }
+  #stat { font-size: 12px; color: var(--dim); margin-top: 14px; font-variant-numeric: tabular-nums; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LED Live</h1>
+  <button id="connect" class="main">연결</button>
+</header>
+<div id="status">연결 안 됨. 연결 없이도 아래 화면에 그려 볼 수 있음.</div>
+
+<canvas id="screen"></canvas>
+
+<h2>그리기</h2>
+<div class="row">
+  <button id="pen" class="on">펜</button>
+  <button id="eraser">지우개</button>
+  <button id="clear">전체 지우기</button>
+  <button id="invert">반전</button>
+</div>
+
+<h2>움직이는 화면</h2>
+<div class="row">
+  <button data-demo="ball">공</button>
+  <button data-demo="rain">비</button>
+  <button data-demo="ripple">물결</button>
+  <button data-demo="clock">시계</button>
+  <button data-demo="sound">소리 반응</button>
+</div>
+
+<label>밝기 <input id="level" type="range" min="8" max="255" value="255"> <span id="levelv">255</span></label>
+<div id="stat"></div>
+
+<script>
+'use strict';
+const W = 32, H = 20, TOP = 15;             // levels 0..15 (4 bits)
+const CMD_FAST = 2, CMD_ACK = 99, CMD_DISCONNECT = 0xE0, CMD_FX = 0xE1, CMD_LIVE = 0xE2, CMD_ERR = 0xFFFF;
+const SHOW = 0x80;
+const MIN_FRAME_MS = 25;                    // 40 frames a second at most: the link takes about 13 KB/s
+const fb = new Uint8Array(W * H);           // the screen, level of every LED
+
+const $ = id => document.getElementById(id);
+const cv = $('screen'), ctx = cv.getContext('2d');
+let dev = null, ch = null, chain = Promise.resolve();
+let busy = false, dirty = false, lastSend = 0, sent = 0, t0 = 0, tagStat = '';
+let tool = 1, demo = null, demoTimer = null, audio = null;
+
+/* ---------- screen ---------- */
+function paint() {
+  const dpr = window.devicePixelRatio || 1, cw = cv.clientWidth, chh = cv.clientHeight;
+  if (cv.width !== Math.round(cw * dpr)) { cv.width = Math.round(cw * dpr); cv.height = Math.round(chh * dpr); }
+  const s = cv.width / W, r = s * 0.36;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const v = fb[y * W + x];
+    ctx.fillStyle = v ? `rgba(255,179,0,${0.25 + 0.75 * v / TOP})` : '#2a2620';
+    ctx.beginPath(); ctx.arc((x + .5) * s, (y + .5) * s, r, 0, 6.2832); ctx.fill();
+  }
+}
+function changed() { paint(); dirty = true; pump(); }
+
+/* ---------- drawing with a finger ---------- */
+let last = null;
+function cell(e) {
+  const b = cv.getBoundingClientRect();
+  return [Math.floor((e.clientX - b.left) * W / b.width), Math.floor((e.clientY - b.top) * H / b.height)];
+}
+function dot(x, y) { if (x >= 0 && x < W && y >= 0 && y < H) fb[y * W + x] = tool ? TOP : 0; }
+function stroke(a, b) {                     // every cell between two touches, so a quick stroke has no gaps
+  let [x, y] = a; const [x1, y1] = b;
+  const dx = Math.abs(x1 - x), dy = -Math.abs(y1 - y), sx = x < x1 ? 1 : -1, sy = y < y1 ? 1 : -1;
+  let err = dx + dy;
+  for (;;) {
+    dot(x, y);
+    if (x === x1 && y === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x += sx; }
+    if (e2 <= dx) { err += dx; y += sy; }
+  }
+}
+cv.addEventListener('pointerdown', e => { stopDemo(); cv.setPointerCapture(e.pointerId); last = cell(e); stroke(last, last); changed(); });
+cv.addEventListener('pointermove', e => { if (!last) return; const c = cell(e); stroke(last, c); last = c; changed(); });
+for (const n of ['pointerup', 'pointercancel']) cv.addEventListener(n, () => { last = null; });
+
+function setTool(t) { tool = t; $('pen').classList.toggle('on', t === 1); $('eraser').classList.toggle('on', t === 0); }
+$('pen').onclick = () => setTool(1);
+$('eraser').onclick = () => setTool(0);
+$('clear').onclick = () => { stopDemo(); fb.fill(0); changed(); };
+$('invert').onclick = () => { stopDemo(); for (let i = 0; i < fb.length; i++) fb[i] = fb[i] ? 0 : TOP; changed(); };
+
+/* ---------- moving screens ---------- */
+const DIGITS = ['111101101101111', '010110010010111', '111001111100111', '111001111001111', '101101111001001',
+                '111100111001111', '111100111101111', '111001001001001', '111101111101111', '111101111001111'];
+function digit(d, x0, y0, k) {              // 3x5 digit, every cell k x k LEDs
+  for (let r = 0; r < 5; r++) for (let c = 0; c < 3; c++) if (DIGITS[d][r * 3 + c] === '1')
+    for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) fb[(y0 + r * k + i) * W + x0 + c * k + j] = TOP;
+}
+const drops = [];
+const demos = {
+  ball: { ms: 33, step(n) {
+    const tri = (t, m) => { t %= 2 * m; return t < m ? t : 2 * m - t; };
+    const cx = 1 + tri(n, W - 3), cy = 1 + tri(Math.floor(n * 2 / 3), H - 3);
+    fb.fill(0);
+    for (let y = cy - 1; y <= cy + 1; y++) for (let x = cx - 1; x <= cx + 1; x++) fb[y * W + x] = TOP;
+  } },
+  rain: { ms: 50, step() {
+    for (let i = 0; i < fb.length; i++) fb[i] = fb[i] > 3 ? fb[i] - 4 : 0;      // tails fade
+    if (Math.random() < 0.7) drops.push([Math.floor(Math.random() * W), 0]);
+    for (const d of drops) { if (d[1] < H) fb[d[1] * W + d[0]] = TOP; d[1]++; }
+    while (drops.length && drops[0][1] > H) drops.shift();
+  } },
+  ripple: { ms: 50, step(n) {
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const d = Math.hypot(x - 15.5, (y - 9.5) * 1.2);
+      fb[y * W + x] = Math.max(0, Math.round((Math.sin(d * 0.9 - n * 0.35) * 0.5 + 0.5) * TOP * Math.max(0.15, 1 - d / 22)));
+    }
+  } },
+  clock: { ms: 500, step(n) {
+    const t = new Date(), h = t.getHours(), m = t.getMinutes();
+    fb.fill(0);
+    digit(Math.floor(h / 10), 1, 5, 2); digit(h % 10, 8, 5, 2);
+    digit(Math.floor(m / 10), 18, 5, 2); digit(m % 10, 25, 5, 2);
+    if (n % 2 === 0) for (const y of [8, 9, 12, 13]) { fb[y * W + 15] = TOP; fb[y * W + 16] = TOP; }
+  } },
+  sound: { ms: 40, step() {
+    if (!audio) return;
+    audio.an.getByteFrequencyData(audio.buf);
+    fb.fill(0);
+    for (let x = 0; x < W; x++) {
+      // low to high tones left to right, a few bins a column (more of them towards the right)
+      const a = Math.floor(2 + Math.pow(x / W, 1.8) * 180), b = Math.floor(2 + Math.pow((x + 1) / W, 1.8) * 180) + 1;
+      let v = 0; for (let i = a; i < b; i++) v = Math.max(v, audio.buf[i]);
+      const hgt = Math.round(v / 255 * H);
+      for (let y = H - hgt; y < H; y++) fb[y * W + x] = TOP;
+    }
+  } },
+};
+async function startDemo(name) {
+  stopDemo();
+  if (name === 'sound' && !audio) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const ac = new (window.AudioContext || window.webkitAudioContext)();
+      const an = ac.createAnalyser(); an.fftSize = 512; an.smoothingTimeConstant = 0.6;
+      ac.createMediaStreamSource(stream).connect(an);
+      audio = { an, buf: new Uint8Array(an.frequencyBinCount) };
+    } catch (e) { say('마이크를 쓸 수 없음: ' + e.message, true); return; }
+  }
+  demo = name;
+  document.querySelectorAll('[data-demo]').forEach(b => b.classList.toggle('on', b.dataset.demo === name));
+  let n = 0;
+  const run = () => { demos[name].step(n++); changed(); };
+  run();
+  demoTimer = setInterval(run, demos[name].ms);
+}
+function stopDemo() {
+  if (demoTimer) clearInterval(demoTimer);
+  demoTimer = null; demo = null;
+  document.querySelectorAll('[data-demo]').forEach(b => b.classList.remove('on'));
+}
+document.querySelectorAll('[data-demo]').forEach(b => { b.onclick = () => demo === b.dataset.demo ? stopDemo() : startDemo(b.dataset.demo); });
+
+/* ---------- Bluetooth ---------- */
+function say(text, err) { $('status').textContent = text; $('status').classList.toggle('err', !!err); }
+function cmd(id, ...payload) { return new Uint8Array([id >> 8, id & 0xFF, ...payload]); }
+function op(fn) { chain = chain.then(fn).catch(e => say('오류: ' + e.message, true)); return chain; }  // one GATT call at a time
+
+/// The writes of the frame on screen: 1 bit a pixel if it is only on / off, else 4 bits in two writes
+function frameWrites() {
+  let flat = true;
+  for (let i = 0; i < fb.length; i++) if (fb[i] && fb[i] !== TOP) { flat = false; break; }
+  if (flat) {
+    const w = new Uint8Array(4 + W * H / 8); w.set([0, CMD_LIVE, 1 | SHOW, 0]);
+    for (let i = 0; i < fb.length; i++) if (fb[i]) w[4 + (i >> 3)] |= 0x80 >> (i & 7);
+    return [w];
+  }
+  const out = [], per = 15;                 // rows a write: 15 x 16 bytes fit one write of 242
+  for (let y0 = 0; y0 < H; y0 += per) {
+    const rows = Math.min(per, H - y0), w = new Uint8Array(4 + rows * W / 2);
+    w.set([0, CMD_LIVE, 4 | (y0 + rows >= H ? SHOW : 0), y0]);
+    for (let i = 0; i < rows * W; i += 2) w[4 + (i >> 1)] = fb[y0 * W + i] << 4 | fb[y0 * W + i + 1];
+    out.push(w);
+  }
+  return out;
+}
+
+/// Send the newest screen, never faster than the link took the last one: no backlog, no lag
+async function pump() {
+  if (!ch || busy || !dirty) return;
+  const wait = MIN_FRAME_MS - (performance.now() - lastSend);
+  if (wait > 0) { setTimeout(pump, wait); return; }
+  busy = true; dirty = false; lastSend = performance.now();
+  await op(async () => { for (const w of frameWrites()) await ch.writeValueWithoutResponse(w); sent++; });
+  busy = false;
+  if (dirty) pump();
+}
+
+function onNotify(e) {
+  const d = e.target.value, id = d.getUint16(0);
+  if (id === CMD_ACK && d.byteLength >= 14) tagStat = `tag: 받음 ${d.getUint32(2, true)}, 표시 ${d.getUint32(6, true)}, 실패 ${d.getUint32(10, true)}`;
+  else if (id === CMD_ERR) say('tag 가 명령을 거부함 (실시간 모드가 없는 펌웨어일 수 있음)', true);
+}
+
+async function connect() {
+  if (!navigator.bluetooth) { say('이 브라우저는 Web Bluetooth 를 지원하지 않음. 안드로이드 또는 PC 의 Chrome 으로 열어야 함.', true); return; }
+  try {
+    say('장치 고르는 중...');
+    dev = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'ATC_' }, { namePrefix: 'atc_' }, { services: [0x1337] }], optionalServices: [0x1337] });
+    dev.addEventListener('gattserverdisconnected', onGone);
+    say('연결 중: ' + dev.name);
+    const gatt = await dev.gatt.connect();
+    const c = await (await gatt.getPrimaryService(0x1337)).getCharacteristic(0x1337);
+    await c.startNotifications();
+    c.addEventListener('characteristicvaluechanged', onNotify);
+    await c.writeValueWithResponse(cmd(CMD_FAST));
+    ch = c; sent = 0; t0 = performance.now(); tagStat = '';
+    $('connect').textContent = '끊기'; $('connect').classList.remove('main');
+    say('연결됨: ' + dev.name);
+    setLevel();
+    dirty = true; pump();
+  } catch (e) { say('연결 실패: ' + e.message, true); onGone(); }
+}
+async function disconnect() {
+  const c = ch; ch = null;
+  if (c) {
+    await op(() => c.writeValueWithResponse(cmd(CMD_LIVE, 0)));         // leave: what played before comes back
+    await new Promise(r => setTimeout(r, 300));                         // its answer carries the tag's counters
+    await op(() => c.writeValueWithResponse(cmd(CMD_DISCONNECT)));      // a Windows PC keeps the link otherwise
+  }
+  if (dev && dev.gatt.connected) dev.gatt.disconnect();
+  onGone();
+}
+function onGone() {
+  ch = null; busy = false;
+  $('connect').textContent = '연결'; $('connect').classList.add('main');
+  if (!$('status').classList.contains('err')) say('연결 안 됨. ' + tagStat);
+}
+$('connect').onclick = () => ch ? disconnect() : connect();
+
+function setLevel() {
+  const v = +$('level').value; $('levelv').textContent = v;
+  if (ch) op(() => ch.writeValueWithResponse(cmd(CMD_FX, 0, 0, v))).then(() => { dirty = true; pump(); });
+}
+$('level').onchange = setLevel;
+$('level').oninput = () => { $('levelv').textContent = $('level').value; };
+
+setInterval(() => {
+  $('stat').textContent = ch ? `보낸 화면 ${sent}장, 평균 초당 ${(sent / ((performance.now() - t0) / 1000)).toFixed(1)}장` : tagStat;
+}, 500);
+window.addEventListener('resize', paint);
+paint();
+</script>
+</body>
+</html>
