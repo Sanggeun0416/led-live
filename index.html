@@ -29,6 +29,8 @@
   .row > button { flex: 1 1 0; white-space: nowrap; }
   label { display: flex; align-items: center; gap: 10px; margin-top: 14px; font-size: 14px; color: var(--dim); }
   input[type=range] { flex: 1; accent-color: var(--led); height: 32px; }
+  input[type=text] { flex: 3 1 0; min-width: 0; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-height: 44px; }
+  input[type=text]:focus { outline: none; border-color: var(--led); }
   h2 { font-size: 13px; color: var(--dim); font-weight: 500; margin: 18px 0 0; }
   #stat { font-size: 12px; color: var(--dim); margin-top: 14px; font-variant-numeric: tabular-nums; white-space: pre-wrap; }
 </style>
@@ -57,6 +59,16 @@
   <button data-demo="ripple">물결</button>
   <button data-demo="clock">시계</button>
   <button data-demo="sound">소리 반응</button>
+</div>
+
+<h2>글자 띄우기</h2>
+<div class="row">
+  <input id="msg" type="text" value="SKAICHIPS 안녕하세요" maxlength="80" placeholder="띄울 문구" enterkeyhint="go">
+  <button data-demo="text">띄우기</button>
+</div>
+<div class="row">
+  <button id="slower">느리게</button>
+  <button id="faster">빠르게</button>
 </div>
 
 <label>밝기 <input id="level" type="range" min="8" max="255" value="255"> <span id="levelv">255</span></label>
@@ -126,6 +138,27 @@ function digit(d, x0, y0, k) {              // 3x5 digit, every cell k x k LEDs
   for (let r = 0; r < 5; r++) for (let c = 0; c < 3; c++) if (DIGITS[d][r * 3 + c] === '1')
     for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) fb[(y0 + r * k + i) * W + x0 + c * k + j] = TOP;
 }
+/// The message as a strip of on / off pixels H rows high, drawn by the browser's own font: so any script the
+/// phone can show (Hangul too) goes on the matrix, which the tag's built-in font cannot do
+let strip = null, stripW = 0, textStep = 1;
+function renderText(text) {
+  const c = document.createElement('canvas'), g = c.getContext('2d');
+  // medium weight: at 20 px a bold Hangul glyph closes up (the two bars of "세" became one block)
+  const font = '500 20px "Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans KR", "Noto Sans CJK KR", sans-serif';
+  g.font = font;
+  stripW = Math.max(1, Math.ceil(g.measureText(text).width) + 2);
+  c.width = stripW; c.height = H;
+  g.font = font; g.textBaseline = 'alphabetic'; g.fillStyle = '#fff';
+  const m = g.measureText(text);
+  // the ink of this very text centred on the H rows (a font's own line box is taller than its glyphs)
+  const up = m.actualBoundingBoxAscent, down = m.actualBoundingBoxDescent;
+  const scale = Math.min(1, H / (up + down));
+  g.setTransform(1, 0, 0, scale, 0, 0);
+  g.fillText(text, 1, (H / scale + up - down) / 2);
+  const d = g.getImageData(0, 0, stripW, H).data;
+  strip = new Uint8Array(stripW * H);
+  for (let i = 0; i < strip.length; i++) strip[i] = d[i * 4 + 3] > 96 ? 1 : 0;
+}
 const drops = [];
 const demos = {
   ball: { ms: 33, step(n) {
@@ -144,6 +177,13 @@ const demos = {
     for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
       const d = Math.hypot(x - 15.5, (y - 9.5) * 1.2);
       fb[y * W + x] = Math.max(0, Math.round((Math.sin(d * 0.9 - n * 0.35) * 0.5 + 0.5) * TOP * Math.max(0.15, 1 - d / 22)));
+    }
+  } },
+  text: { ms: 33, step(n) {                 // the strip runs in from the right edge and out at the left, again and again
+    const off = (n * textStep) % (stripW + W) - W;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const sx = x + off;
+      fb[y * W + x] = sx >= 0 && sx < stripW && strip[y * stripW + sx] ? TOP : 0;
     }
   } },
   clock: { ms: 500, step(n) {
@@ -177,6 +217,12 @@ async function startDemo(name) {
       audio = { an, buf: new Uint8Array(an.frequencyBinCount) };
     } catch (e) { say('마이크를 쓸 수 없음: ' + e.message, true); return; }
   }
+  if (name === 'text') {
+    const t = $('msg').value.trim();
+    if (!t) { say('띄울 문구를 먼저 입력해야 함', true); return; }
+    renderText(t);
+    $('msg').blur();                        // the phone's keyboard goes away
+  }
   demo = name;
   document.querySelectorAll('[data-demo]').forEach(b => b.classList.toggle('on', b.dataset.demo === name));
   let n = 0;
@@ -189,6 +235,9 @@ function stopDemo() {
   demoTimer = null; demo = null;
   document.querySelectorAll('[data-demo]').forEach(b => b.classList.remove('on'));
 }
+$('msg').addEventListener('keydown', e => { if (e.key === 'Enter') startDemo('text'); });
+$('slower').onclick = () => { textStep = Math.max(1, textStep - 1); };
+$('faster').onclick = () => { textStep = Math.min(4, textStep + 1); };
 document.querySelectorAll('[data-demo]').forEach(b => { b.onclick = () => demo === b.dataset.demo ? stopDemo() : startDemo(b.dataset.demo); });
 
 /* ---------- Bluetooth ---------- */
