@@ -267,7 +267,8 @@ function sheetFrame(s, n) {
 /// preview here only runs alongside. A tag without the sheet asks for the data instead: then the page sends
 /// the frames itself as a live screen (onNotify, CMD_REQ).
 function askSheet(s) {
-  const w = new Uint8Array(18), v = new DataView(w.buffer);
+  // 2 bytes of command id + struct AvailDataInfo (17 bytes, packed): a shorter write is refused
+  const w = new Uint8Array(19), v = new DataView(w.buffer);
   v.setUint16(0, CMD_AVAIL); w[2] = 0xFF;                   // checksum byte, not looked at
   v.setUint32(3, s.ver, true); v.setUint32(7, 0, true);     // dataVer: the sheet's CRC-32, high half 0
   v.setUint32(11, 128 * 296 / 8, true); w[15] = 0x20;       // size of a sheet, raw 1 bpp
