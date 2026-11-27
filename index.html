@@ -300,6 +300,7 @@ async function startDemo(name) {
   sceneNext = true;
   blendWant = demos[name].blend || demos[name].ms;
   sceneFade(); mixMs = blendWant;
+  nowPlaying(name === 'text' ? '전광판' : document.querySelector(`[data-demo="${name}"]`).textContent);
   document.querySelectorAll('[data-demo]').forEach(b => b.classList.toggle('on', b.dataset.demo === name));
   let n = 0;
   const run = () => { demos[name].step(n++); changed(); };
@@ -311,6 +312,7 @@ function stopDemo() {
   demo = null; sheet = null; sheetStream = false; mute = false;
   blendWant = 0;                            // a finger drawing goes up at once
   mixMs = 0; fade = null; gain = 1; snapNext = false;
+  nowPlaying(null);
   document.querySelectorAll('[data-demo], [data-sheet]').forEach(b => b.classList.remove('on'));
 }
 $('msg').addEventListener('keydown', e => { if (e.key === 'Enter') startDemo('text'); });
@@ -355,6 +357,7 @@ function startSheet(s) {
   stopDemo();
   sheet = s; mute = true; dirty = false;
   sceneFade(); mixMs = 100;                 // as the tag shows it: 10 frames a second, mixed
+  nowPlaying(s.label);
   document.querySelectorAll('[data-sheet]').forEach(b => b.classList.toggle('on', b.dataset.sheet === s.id));
   let n = 0;
   const run = () => { sheetFrame(s, n++); if (sheetStream) changed(); else touch(); };
@@ -373,6 +376,8 @@ for (const s of SHEETS) {
 
 /* ---------- Bluetooth ---------- */
 function say(text, err) { $('status').textContent = text; $('status').classList.toggle('err', !!err); }
+/// The status line while connected: what is on the matrix now (an animation's name, or the drawing)
+function nowPlaying(label) { if (ch) say(label ? '재생 중: ' + label : '연결됨: ' + dev.name + ' · 그림판'); }
 function cmd(id, ...payload) { return new Uint8Array([id >> 8, id & 0xFF, ...payload]); }
 function op(fn) { chain = chain.then(fn).catch(e => say('오류: ' + e.message, true)); return chain; }  // one GATT call at a time
 
@@ -417,15 +422,12 @@ async function pump() {
 
 function onNotify(e) {
   const d = e.target.value, id = d.getUint16(0);
-  if (id === CMD_AVAIL_ACK && sheet) say('재생 중: ' + sheet.label);
-  else if (id === CMD_SHOWN && sheet) {
+  if (id === CMD_SHOWN && sheet) {
     // it is the sheet the tag had up before the live screen: leaving the live screen brings it back
     op(() => ch.writeValueWithResponse(cmd(CMD_LIVE, 0)));
-    say('재생 중: ' + sheet.label);
   } else if (id === CMD_REQ && sheet) {
     sheetStream = true; mute = false;       // not built into this tag: the page sends the frames
     sceneNext = true; blendWant = 100;
-    say('재생 중: ' + sheet.label);
   }
   else if (id === CMD_ERR) say('tag 가 명령을 거부함 (실시간 모드가 없는 펌웨어일 수 있음)', true);
 }
@@ -447,8 +449,8 @@ async function connect() {
     await c.writeValueWithResponse(cmd(CMD_LIVE, LIVE_SET, 0));
     ch = c; sent = 0; sentAt = 0; blendSent = 0;
     $('connect').textContent = '끊기'; $('connect').classList.remove('main');
-    say('연결됨: ' + dev.name);
     keepAwake(true);
+    nowPlaying(sheet ? sheet.label : demo ? (demo === 'text' ? '전광판' : document.querySelector(`[data-demo="${demo}"]`).textContent) : null);
     setLevel();
     if (sheet) askSheet(sheet); else { dirty = true; pump(); }
   } catch (e) { say('연결 실패: ' + e.message, true); onGone(); }
