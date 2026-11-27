@@ -371,7 +371,9 @@ async function connect() {
     await c.startNotifications();
     c.addEventListener('characteristicvaluechanged', onNotify);
     await c.writeValueWithResponse(cmd(CMD_FAST));
-    ch = c; sent = 0; sentAt = 0; blendSent = -1;
+    // a live setting first: it marks this link as a phone's, even if only stored animations get picked
+    await c.writeValueWithResponse(cmd(CMD_LIVE, LIVE_SET, 0));
+    ch = c; sent = 0; sentAt = 0; blendSent = 0;
     $('connect').textContent = '끊기'; $('connect').classList.remove('main');
     say('연결됨: ' + dev.name);
     setLevel();
@@ -381,9 +383,9 @@ async function connect() {
 async function disconnect() {
   const c = ch; ch = null;
   if (c) {
-    await op(() => c.writeValueWithResponse(cmd(CMD_LIVE, 0)));         // leave: what played before comes back
-    await new Promise(r => setTimeout(r, 300));                         // its answer carries the tag's counters
-    await op(() => c.writeValueWithResponse(cmd(CMD_DISCONNECT)));      // a Windows PC keeps the link otherwise
+    // The tag goes idle when a link that used the live screen ends, and asks the relay for its next page.
+    // A Windows PC keeps the link after gatt.disconnect(), so the tag is told to drop it
+    await op(() => c.writeValueWithResponse(cmd(CMD_DISCONNECT)));
   }
   if (dev && dev.gatt.connected) dev.gatt.disconnect();
   onGone();
