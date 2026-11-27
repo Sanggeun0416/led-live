@@ -181,6 +181,28 @@ $('clear').onclick = () => { stopDemo(); fb.fill(0); changed(); };
 $('invert').onclick = () => { stopDemo(); for (let i = 0; i < fb.length; i++) fb[i] = fb[i] ? 0 : TOP; changed(); };
 
 /* ---------- moving screens ---------- */
+// A browser holds the timers of a page it does not show (another tab in front) back to one a second, and the
+// animations made here crawled. A worker's timers are left alone on a PC, so the animations tick from one.
+// A phone that puts the browser in the background stops the page altogether: nothing here can help that,
+// only the animations the tag plays itself go on.
+let ticker = null, tickFn = null;
+try {
+  const src = 'let t=null;onmessage=e=>{clearInterval(t);t=e.data?setInterval(()=>postMessage(0),e.data):null;};';
+  ticker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+  ticker.onmessage = () => { if (tickFn) tickFn(); };
+  ticker.onerror = () => { ticker = null; };
+} catch (e) { ticker = null; }
+function every(ms, fn) {
+  everyStop();
+  tickFn = fn;
+  if (ticker) ticker.postMessage(ms); else demoTimer = setInterval(fn, ms);
+}
+function everyStop() {
+  tickFn = null;
+  if (ticker) ticker.postMessage(0);
+  if (demoTimer) clearInterval(demoTimer);
+  demoTimer = null;
+}
 const DIGITS = ['111101101101111', '010110010010111', '111001111100111', '111001111001111', '101101111001001',
                 '111100111001111', '111100111101111', '111001001001001', '111101111101111', '111101111001111'];
 function digit(d, x0, y0, k) {              // 3x5 digit, every cell k x k LEDs
@@ -282,11 +304,11 @@ async function startDemo(name) {
   let n = 0;
   const run = () => { demos[name].step(n++); changed(); };
   run();
-  demoTimer = setInterval(run, demos[name].ms);
+  every(demos[name].ms, run);
 }
 function stopDemo() {
-  if (demoTimer) clearInterval(demoTimer);
-  demoTimer = null; demo = null; sheet = null; sheetStream = false; mute = false;
+  everyStop();
+  demo = null; sheet = null; sheetStream = false; mute = false;
   blendWant = 0;                            // a finger drawing goes up at once
   mixMs = 0; fade = null; gain = 1; snapNext = false;
   document.querySelectorAll('[data-demo], [data-sheet]').forEach(b => b.classList.remove('on'));
@@ -337,7 +359,7 @@ function startSheet(s) {
   let n = 0;
   const run = () => { sheetFrame(s, n++); if (sheetStream) changed(); else touch(); };
   run();
-  demoTimer = setInterval(run, 100);        // the sheets are drawn for 10 frames a second
+  every(100, run);                          // the sheets are drawn for 10 frames a second
   if (ch) askSheet(s);
 }
 // One list for the user: the stored animations first, then the ones the page computes
@@ -426,6 +448,7 @@ async function connect() {
     ch = c; sent = 0; sentAt = 0; blendSent = 0;
     $('connect').textContent = '끊기'; $('connect').classList.remove('main');
     say('연결됨: ' + dev.name);
+    keepAwake(true);
     setLevel();
     if (sheet) askSheet(sheet); else { dirty = true; pump(); }
   } catch (e) { say('연결 실패: ' + e.message, true); onGone(); }
@@ -440,8 +463,17 @@ async function disconnect() {
   if (dev && dev.gatt.connected) dev.gatt.disconnect();
   onGone();
 }
+/// The phone's screen stays on while the tag is connected: a dark screen stops the page and the matrix freezes
+let wake = null;
+async function keepAwake(on) {
+  try {
+    if (on && !wake && navigator.wakeLock) { wake = await navigator.wakeLock.request('screen'); wake.onrelease = () => { wake = null; }; }
+    else if (!on && wake) { await wake.release(); wake = null; }
+  } catch (e) { wake = null; }
+}
+document.addEventListener('visibilitychange', () => { if (ch && document.visibilityState === 'visible') keepAwake(true); });
 function onGone() {
-  ch = null; busy = false;
+  ch = null; busy = false; keepAwake(false);
   $('connect').textContent = '연결'; $('connect').classList.add('main');
   if (!$('status').classList.contains('err')) say('연결 안 됨.');
 }
