@@ -81,7 +81,7 @@
 const W = 32, H = 20, TOP = 15;             // levels 0..15 (4 bits)
 const CMD_AVAIL = 100, CMD_REQ = 198, CMD_AVAIL_ACK = 199, CMD_SHOWN = 200;   // the upload announcement and its answers
 const CMD_FAST = 2, CMD_ACK = 99, CMD_DISCONNECT = 0xE0, CMD_FX = 0xE1, CMD_LIVE = 0xE2, CMD_ERR = 0xFFFF;
-const SHOW = 0x80;
+const SHOW = 0x80, SCENE = 0x40, LIVE_SET = 0x0F;
 const MIN_FRAME_MS = 25;                    // 40 frames a second at most: the link takes about 13 KB/s
 const fb = new Uint8Array(W * H);           // the screen, level of every LED
 
@@ -90,6 +90,7 @@ const cv = $('screen'), ctx = cv.getContext('2d');
 let dev = null, ch = null, chain = Promise.resolve();
 let busy = false, dirty = false, lastSend = 0, sent = 0, sentAt = 0;
 let tool = 1, demo = null, demoTimer = null, audio = null;
+let sceneNext = false, blendWant = 0, blendSent = -1;   // the next frame opens a scene / crossfade time in ms, wanted and at the tag
 let sheet = null, sheetStream = false, mute = false;   // a stored animation is selected / the page has to send it / nothing is sent
 
 /* ---------- screen ---------- */
@@ -165,7 +166,7 @@ function renderText(text) {
 }
 const drops = [];
 const demos = {
-  ball: { ms: 33, step(n) {
+  ball: { ms: 50, step(n) {
     const tri = (t, m) => { t %= 2 * m; return t < m ? t : 2 * m - t; };
     const cx = 1 + tri(n, W - 3), cy = 1 + tri(Math.floor(n * 2 / 3), H - 3);
     fb.fill(0);
@@ -183,14 +184,14 @@ const demos = {
       fb[y * W + x] = Math.max(0, Math.round((Math.sin(d * 0.9 - n * 0.35) * 0.5 + 0.5) * TOP * Math.max(0.15, 1 - d / 22)));
     }
   } },
-  text: { ms: 33, step(n) {                 // the strip runs in from the right edge and out at the left, again and again
+  text: { ms: 40, step(n) {                 // the strip runs in from the right edge and out at the left, again and again
     const off = (n * textStep) % (stripW + W) - W;
     for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
       const sx = x + off;
       fb[y * W + x] = sx >= 0 && sx < stripW && strip[y * stripW + sx] ? TOP : 0;
     }
   } },
-  clock: { ms: 500, step(n) {
+  clock: { ms: 500, blend: 200, step(n) {
     const t = new Date(), h = t.getHours(), m = t.getMinutes();
     fb.fill(0);
     digit(Math.floor(h / 10), 1, 5, 2); digit(h % 10, 8, 5, 2);
@@ -228,6 +229,10 @@ async function startDemo(name) {
     $('msg').blur();                        // the phone's keyboard goes away
   }
   demo = name;
+  // A new scene comes in through the dark, and its frames are mixed by the tag over one frame time: both as
+  // the tag does for its own sheets, so every animation changes and moves the same way
+  sceneNext = true;
+  blendWant = demos[name].blend || demos[name].ms;
   document.querySelectorAll('[data-demo]').forEach(b => b.classList.toggle('on', b.dataset.demo === name));
   let n = 0;
   const run = () => { demos[name].step(n++); changed(); };
@@ -237,6 +242,7 @@ async function startDemo(name) {
 function stopDemo() {
   if (demoTimer) clearInterval(demoTimer);
   demoTimer = null; demo = null; sheet = null; sheetStream = false; mute = false;
+  blendWant = 0;                            // a finger drawing goes up at once
   document.querySelectorAll('[data-demo], [data-sheet]').forEach(b => b.classList.remove('on'));
 }
 $('msg').addEventListener('keydown', e => { if (e.key === 'Enter') startDemo('text'); });
@@ -299,18 +305,19 @@ function cmd(id, ...payload) { return new Uint8Array([id >> 8, id & 0xFF, ...pay
 function op(fn) { chain = chain.then(fn).catch(e => say('오류: ' + e.message, true)); return chain; }  // one GATT call at a time
 
 /// The writes of the frame on screen: 1 bit a pixel if it is only on / off, else 4 bits in two writes
-function frameWrites() {
+function frameWrites(scene) {
+  const flag = scene ? SCENE : 0;
   let flat = true;
   for (let i = 0; i < fb.length; i++) if (fb[i] && fb[i] !== TOP) { flat = false; break; }
   if (flat) {
-    const w = new Uint8Array(4 + W * H / 8); w.set([0, CMD_LIVE, 1 | SHOW, 0]);
+    const w = new Uint8Array(4 + W * H / 8); w.set([0, CMD_LIVE, 1 | SHOW | flag, 0]);
     for (let i = 0; i < fb.length; i++) if (fb[i]) w[4 + (i >> 3)] |= 0x80 >> (i & 7);
     return [w];
   }
   const out = [], per = 15;                 // rows a write: 15 x 16 bytes fit one write of 242
   for (let y0 = 0; y0 < H; y0 += per) {
     const rows = Math.min(per, H - y0), w = new Uint8Array(4 + rows * W / 2);
-    w.set([0, CMD_LIVE, 4 | (y0 + rows >= H ? SHOW : 0), y0]);
+    w.set([0, CMD_LIVE, 4 | (y0 + rows >= H ? SHOW : 0) | flag, y0]);
     for (let i = 0; i < rows * W; i += 2) w[4 + (i >> 1)] = fb[y0 * W + i] << 4 | fb[y0 * W + i + 1];
     out.push(w);
   }
@@ -323,7 +330,15 @@ async function pump() {
   const wait = MIN_FRAME_MS - (performance.now() - lastSend);
   if (wait > 0) { setTimeout(pump, wait); return; }
   busy = true; dirty = false; lastSend = performance.now();
-  await op(async () => { for (const w of frameWrites()) await ch.writeValueWithoutResponse(w); sent++; });
+  await op(async () => {
+    if (blendSent !== blendWant) {
+      await ch.writeValueWithResponse(cmd(CMD_LIVE, LIVE_SET, Math.min(255, Math.round(blendWant / 10))));
+      blendSent = blendWant;
+    }
+    const scene = sceneNext; sceneNext = false;
+    for (const w of frameWrites(scene)) await ch.writeValueWithoutResponse(w);
+    sent++;
+  });
   busy = false;
   if (dirty) pump();
 }
@@ -337,6 +352,7 @@ function onNotify(e) {
     say('재생 중: ' + sheet.label);
   } else if (id === CMD_REQ && sheet) {
     sheetStream = true; mute = false;       // not built into this tag: the page sends the frames
+    sceneNext = true; blendWant = 100;
     say('재생 중: ' + sheet.label);
   }
   else if (id === CMD_ERR) say('tag 가 명령을 거부함 (실시간 모드가 없는 펌웨어일 수 있음)', true);
@@ -355,7 +371,7 @@ async function connect() {
     await c.startNotifications();
     c.addEventListener('characteristicvaluechanged', onNotify);
     await c.writeValueWithResponse(cmd(CMD_FAST));
-    ch = c; sent = 0; sentAt = 0;
+    ch = c; sent = 0; sentAt = 0; blendSent = -1;
     $('connect').textContent = '끊기'; $('connect').classList.remove('main');
     say('연결됨: ' + dev.name);
     setLevel();
