@@ -66,7 +66,7 @@
 <h2>전광판 <span id="msgn"></span></h2>
 <div class="row">
   <input id="msg" type="text" value="SKAICHIPS 안녕하세요" maxlength="80" placeholder="띄울 문구" enterkeyhint="go">
-  <button data-demo="text">띄우기</button>
+  <button id="go">띄우기</button>
 </div>
 <div class="row">
   <button id="slower">느리게</button>
@@ -99,7 +99,7 @@ let sheet = null, sheetStream = false, mute = false;   // a stored animation is 
 // (the tag's OEPL_LED_FADE_OUT_MS / _IN_MS, squared ramps)
 const FADE_OUT_MS = 300, FADE_IN_MS = 500;
 const shown = new Float32Array(W * H);
-let gain = 1, fade = null, fadeT0 = 0, fadeFrom = 1, snapNext = false;
+let gain = 1, fade = null, fadeT0 = 0, fadeFrom = 1, snapNext = false, holdDark = false;
 let mixMs = 0, mixEnd = 0, lastTick = performance.now(), drawn = false;
 
 function draw() {
@@ -124,7 +124,7 @@ function sceneFade() {
   const now = performance.now();
   if (fade === 'out') return;
   if (gain > 0.02 && shown.some(v => v > 0.5)) { fade = 'out'; fadeFrom = gain; }
-  else { fade = 'in'; gain = 0; snapNext = true; }
+  else { fade = holdDark ? 'dark' : 'in'; gain = 0; snapNext = true; }
   fadeT0 = now;
 }
 function tick(now) {
@@ -132,7 +132,10 @@ function tick(now) {
   let moving = false;
   if (fade === 'out') {                     // the old scene stays as it is while it dims
     const u = 1 - (now - fadeT0) / FADE_OUT_MS;
-    if (u <= 0) { gain = 0; shown.set(fb); fade = 'in'; fadeT0 = now; } else gain = fadeFrom * u * u;
+    if (u <= 0) { gain = 0; shown.set(fb); fade = holdDark ? 'dark' : 'in'; fadeT0 = now; } else gain = fadeFrom * u * u;
+    moving = true;
+  } else if (fade === 'dark') {             // an upload runs: the matrix is dark until the tag has drawn it
+    if (!holdDark) { shown.set(fb); fade = 'in'; fadeT0 = now; }
     moving = true;
   } else {
     if (fade === 'in') {
@@ -211,7 +214,9 @@ function digit(d, x0, y0, k) {              // 3x5 digit, every cell k x k LEDs
 }
 /// The message as a strip of on / off pixels H rows high, drawn by the browser's own font: so any script the
 /// phone can show (Hangul too) goes on the matrix, which the tag's built-in font cannot do
-let strip = null, stripW = 0, textStep = 1;
+let strip = null, stripW = 0;
+const TEXT_FPS = [15, 25, 40, 60];          // columns a second the tag moves the strip
+let textSpeed = 1;
 function renderText(text) {
   const c = document.createElement('canvas'), g = c.getContext('2d');
   // medium weight: at 20 px a bold Hangul glyph closes up (the two bars of "세" became one block)
@@ -250,13 +255,6 @@ const demos = {
       fb[y * W + x] = Math.max(0, Math.round((Math.sin(d * 0.9 - n * 0.35) * 0.5 + 0.5) * TOP * Math.max(0.15, 1 - d / 22)));
     }
   } },
-  text: { ms: 40, step(n) {                 // the strip runs in from the right edge and out at the left, again and again
-    const off = (n * textStep) % (stripW + W) - W;
-    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-      const sx = x + off;
-      fb[y * W + x] = sx >= 0 && sx < stripW && strip[y * stripW + sx] ? TOP : 0;
-    }
-  } },
   clock: { ms: 500, blend: 200, step(n) {
     const t = new Date(), h = t.getHours(), m = t.getMinutes();
     fb.fill(0);
@@ -288,19 +286,13 @@ async function startDemo(name) {
       audio = { an, buf: new Uint8Array(an.frequencyBinCount) };
     } catch (e) { say('마이크를 쓸 수 없음: ' + e.message, true); return; }
   }
-  if (name === 'text') {
-    const t = $('msg').value.trim();
-    if (!t) { say('띄울 문구를 먼저 입력해야 함', true); return; }
-    renderText(t);
-    $('msg').blur();                        // the phone's keyboard goes away
-  }
   demo = name;
   // A new scene comes in through the dark, and its frames are mixed by the tag over one frame time: both as
   // the tag does for its own sheets, so every animation changes and moves the same way
   sceneNext = true;
   blendWant = demos[name].blend || demos[name].ms;
   sceneFade(); mixMs = blendWant;
-  nowPlaying(name === 'text' ? '전광판' : document.querySelector(`[data-demo="${name}"]`).textContent);
+  nowPlaying(document.querySelector(`[data-demo="${name}"]`).textContent);
   document.querySelectorAll('[data-demo]').forEach(b => b.classList.toggle('on', b.dataset.demo === name));
   let n = 0;
   const run = () => { demos[name].step(n++); changed(); };
@@ -311,16 +303,18 @@ function stopDemo() {
   everyStop();
   demo = null; sheet = null; sheetStream = false; mute = false;
   blendWant = 0;                            // a finger drawing goes up at once
-  mixMs = 0; fade = null; gain = 1; snapNext = false;
+  mixMs = 0; fade = null; gain = 1; snapNext = false; holdDark = false; up = null;
   nowPlaying(null);
   document.querySelectorAll('[data-demo], [data-sheet]').forEach(b => b.classList.remove('on'));
+  $('go').classList.remove('on');
 }
-$('msg').addEventListener('keydown', e => { if (e.key === 'Enter') startDemo('text'); });
+$('msg').addEventListener('keydown', e => { if (e.key === 'Enter') startText(); });
 const countMsg = () => { $('msgn').textContent = `(${$('msg').value.length} / ${$('msg').maxLength}자)`; };
 $('msg').addEventListener('input', countMsg);
 countMsg();
-$('slower').onclick = () => { textStep = Math.max(1, textStep - 1); };
-$('faster').onclick = () => { textStep = Math.min(4, textStep + 1); };
+$('slower').onclick = () => { textSpeed = Math.max(0, textSpeed - 1); if (sheet && sheet.banner) startText(); };
+$('faster').onclick = () => { textSpeed = Math.min(TEXT_FPS.length - 1, textSpeed + 1); if (sheet && sheet.banner) startText(); };
+$('go').onclick = () => sheet && sheet.banner ? stopDemo() : startText();
 document.querySelectorAll('[data-demo]').forEach(b => { b.onclick = () => demo === b.dataset.demo ? stopDemo() : startDemo(b.dataset.demo); });
 
 /* ---------- stored animations ---------- */
@@ -345,14 +339,88 @@ function sheetFrame(s, n) {
 /// its own copy, with its crossfade, and goes on after the link is gone. Nothing is sent meanwhile (mute); the
 /// preview here only runs alongside. A tag without the sheet asks for the data instead: then the page sends
 /// the frames itself as a live screen (onNotify, CMD_REQ).
-function askSheet(s) {
+function askSheet(ver) {
   // 2 bytes of command id + struct AvailDataInfo (17 bytes, packed): a shorter write is refused
   const w = new Uint8Array(19), v = new DataView(w.buffer);
   v.setUint16(0, CMD_AVAIL); w[2] = 0xFF;                   // checksum byte, not looked at
-  v.setUint32(3, s.ver, true); v.setUint32(7, 0, true);     // dataVer: the sheet's CRC-32, high half 0
+  v.setUint32(3, ver, true); v.setUint32(7, 0, true);       // dataVer: the sheet's CRC-32, high half 0
   v.setUint32(11, 128 * 296 / 8, true); w[15] = 0x20;       // size of a sheet, raw 1 bpp
   op(() => ch.writeValueWithResponse(w));
 }
+/* A sheet the tag does not have is sent to it (the block transfer of tools/ble_upload/ble_upload.py): the tag
+   stores it, plays it by itself and asks for nothing more. The signboard goes this way: the strip of text is
+   a banner sheet, and the tag moves it a column at a time on its own clock. Frames sent from here arrive in
+   bursts, which a crossfade hides but a steady scroll does not. */
+const SHEET_BYTES = 128 * 296 / 8, BLOCK = 4096, PART = 230;
+const CRC_T = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function withHeader(b) {                    // [size][16-bit sum] in front, as the WebTool does
+  const o = new Uint8Array(b.length + 4); let sum = 0;
+  for (let i = 0; i < b.length; i++) sum += b[i];
+  o.set([b.length & 0xFF, b.length >> 8, sum & 0xFF, (sum >> 8) & 0xFF]); o.set(b, 4);
+  return o;
+}
+let up = null;                              // the upload under way: { data, parts, idx }
+function showOnTag(s) {
+  if (!s.data) { askSheet(s.ver); return; }
+  up = { data: s.data, parts: [], idx: 0 };
+  askSheet(crc32(withHeader(s.data)));
+}
+function uploadBlock(blk) {                 // the tag asked for a block: its parts go out one at a time
+  const chunk = withHeader(up.data.subarray(blk * BLOCK, (blk + 1) * BLOCK));
+  up.parts = []; up.idx = 0;
+  for (let i = 0; i * PART < chunk.length; i++) {
+    const w = new Uint8Array(5 + PART); let sum = blk + i;
+    w.set([0, 0x65, 0, blk, i]); w.set(chunk.subarray(i * PART, (i + 1) * PART), 5);
+    for (let k = 5; k < w.length; k++) sum += w[k];
+    w[2] = sum & 0xFF;
+    up.parts.push(w);
+  }
+  uploadPart();
+}
+function uploadPart() { const w = up.parts[up.idx]; op(() => ch.writeValueWithoutResponse(w)); }
+
+/// The message as a banner sheet (src/main/oepl_led.c sheet_kind): strip column b is at row (b / 128) * H + y,
+/// column b % 128 of the 128 x 296 sheet, and the last row says "SCRL", 1, columns a second, strip length
+function bannerSheet(fps) {
+  const gap = W, len = Math.min(stripW + gap, Math.floor(295 / H) * 128);
+  const d = new Uint8Array(SHEET_BYTES);
+  for (let b = gap; b < len; b++) for (let y = 0; y < H; y++) {
+    if (strip[y * stripW + b - gap]) d[(Math.floor(b / 128) * H + y) * 16 + ((b % 128) >> 3)] |= 0x80 >> (b % 8);
+  }
+  d.set([0x53, 0x43, 0x52, 0x4C, 1, fps, len & 0xFF, len >> 8], 295 * 16);
+  return { data: d, len, gap };
+}
+function startText() {
+  const t = $('msg').value.trim();
+  if (!t) { say('띄울 문구를 먼저 입력해야 함', true); return; }
+  stopDemo();
+  renderText(t);
+  $('msg').blur();                          // the phone's keyboard goes away
+  const fps = TEXT_FPS[textSpeed], bn = bannerSheet(fps);
+  sheet = { label: '전광판', banner: true, data: bn.data };
+  mute = true; dirty = false;
+  $('go').classList.add('on');
+  holdDark = !!ch;                          // dark until the tag has the sheet, as the matrix is
+  sceneFade(); mixMs = 1000 / fps;
+  const t0 = performance.now();
+  const run = () => {                       // the same strip, moved by the clock as the tag does
+    const off = Math.floor((performance.now() - t0) * fps / 1000) % bn.len;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const b = (off + x) % bn.len - bn.gap;
+      fb[y * W + x] = b >= 0 && b < stripW && strip[y * stripW + b] ? TOP : 0;
+    }
+    touch();
+  };
+  run();
+  every(1000 / fps, run);
+  if (ch) { say('전광판 전송 중...'); showOnTag(sheet); }
+}
+
 function startSheet(s) {
   stopDemo();
   sheet = s; mute = true; dirty = false;
@@ -363,7 +431,7 @@ function startSheet(s) {
   const run = () => { sheetFrame(s, n++); if (sheetStream) changed(); else touch(); };
   run();
   every(100, run);                          // the sheets are drawn for 10 frames a second
-  if (ch) askSheet(s);
+  if (ch) showOnTag(s);
 }
 // One list for the user: the stored animations first, then the ones the page computes
 const firstDemo = $('anims').firstElementChild;
@@ -422,11 +490,17 @@ async function pump() {
 
 function onNotify(e) {
   const d = e.target.value, id = d.getUint16(0);
-  if (id === CMD_SHOWN && sheet) {
-    // it is the sheet the tag had up before the live screen: leaving the live screen brings it back
-    op(() => ch.writeValueWithResponse(cmd(CMD_LIVE, 0)));
-  } else if (id === CMD_REQ && sheet) {
-    sheetStream = true; mute = false;       // not built into this tag: the page sends the frames
+  if (id === CMD_REQ && up) uploadBlock(d.getUint8(2 + 9));         // blockRequest: checksum, ver[8], block
+  else if (id === 0xC5 && up) { if (++up.idx < up.parts.length) uploadPart(); }
+  else if (id === 0xC4 && up) setTimeout(() => { if (up) uploadPart(); }, 100);     // a part arrived damaged: again
+  else if ((id === CMD_AVAIL_ACK || id === CMD_SHOWN) && sheet) {
+    // The tag plays the sheet (its built-in copy, or the upload is in and drawn). "Shown" means it had the
+    // sheet up before the live screen took over: leaving the live screen brings it back
+    if (id === CMD_SHOWN) op(() => ch.writeValueWithResponse(cmd(CMD_LIVE, 0)));
+    up = null; holdDark = false;
+    nowPlaying(sheet.label);
+  } else if (id === CMD_REQ && sheet && !sheet.data) {
+    sheetStream = true; mute = false;       // a stored animation this tag does not have: the page sends the frames
     sceneNext = true; blendWant = 100;
   }
   else if (id === CMD_ERR) say('tag 가 명령을 거부함 (실시간 모드가 없는 펌웨어일 수 있음)', true);
@@ -450,9 +524,9 @@ async function connect() {
     ch = c; sent = 0; sentAt = 0; blendSent = 0;
     $('connect').textContent = '끊기'; $('connect').classList.remove('main');
     keepAwake(true);
-    nowPlaying(sheet ? sheet.label : demo ? (demo === 'text' ? '전광판' : document.querySelector(`[data-demo="${demo}"]`).textContent) : null);
+    nowPlaying(sheet ? sheet.label : demo ? document.querySelector(`[data-demo="${demo}"]`).textContent : null);
     setLevel();
-    if (sheet) askSheet(sheet); else { dirty = true; pump(); }
+    if (sheet) showOnTag(sheet); else { dirty = true; pump(); }
   } catch (e) { say('연결 실패: ' + e.message, true); onGone(); }
 }
 async function disconnect() {
