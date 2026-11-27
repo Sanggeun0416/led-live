@@ -34,7 +34,7 @@
   input[type=text] { flex: 3 1 0; min-width: 0; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-height: 44px; }
   input[type=text]:focus { outline: none; border-color: var(--led); }
   h2 { font-size: 13px; color: var(--dim); font-weight: 500; margin: 18px 0 0; }
-  #stat { font-size: 12px; color: var(--dim); margin-top: 14px; font-variant-numeric: tabular-nums; white-space: pre-wrap; }
+  #stat { font-size: 14px; color: var(--dim); margin-top: 14px; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -72,9 +72,9 @@
   <button id="slower">느리게</button>
   <button id="faster">빠르게</button>
 </div>
+<div id="stat">FPS -</div>
 
 <label>밝기 <input id="level" type="range" min="8" max="255" value="255"> <span id="levelv">255</span></label>
-<div id="stat"></div>
 
 <script>
 'use strict';
@@ -88,7 +88,7 @@ const fb = new Uint8Array(W * H);           // the screen, level of every LED
 const $ = id => document.getElementById(id);
 const cv = $('screen'), ctx = cv.getContext('2d');
 let dev = null, ch = null, chain = Promise.resolve();
-let busy = false, dirty = false, lastSend = 0, sent = 0, t0 = 0, tagStat = '';
+let busy = false, dirty = false, lastSend = 0, sent = 0, sentAt = 0;
 let tool = 1, demo = null, demoTimer = null, audio = null;
 let sheet = null, sheetStream = false, mute = false;   // a stored animation is selected / the page has to send it / nothing is sent
 
@@ -330,8 +330,7 @@ async function pump() {
 
 function onNotify(e) {
   const d = e.target.value, id = d.getUint16(0);
-  if (id === CMD_ACK && d.byteLength >= 14) tagStat = `tag: 받음 ${d.getUint32(2, true)}, 표시 ${d.getUint32(6, true)}, 실패 ${d.getUint32(10, true)}`;
-  else if (id === CMD_AVAIL_ACK && sheet) say('재생 중: ' + sheet.label);
+  if (id === CMD_AVAIL_ACK && sheet) say('재생 중: ' + sheet.label);
   else if (id === CMD_SHOWN && sheet) {
     // it is the sheet the tag had up before the live screen: leaving the live screen brings it back
     op(() => ch.writeValueWithResponse(cmd(CMD_LIVE, 0)));
@@ -356,7 +355,7 @@ async function connect() {
     await c.startNotifications();
     c.addEventListener('characteristicvaluechanged', onNotify);
     await c.writeValueWithResponse(cmd(CMD_FAST));
-    ch = c; sent = 0; t0 = performance.now(); tagStat = '';
+    ch = c; sent = 0; sentAt = 0;
     $('connect').textContent = '끊기'; $('connect').classList.remove('main');
     say('연결됨: ' + dev.name);
     setLevel();
@@ -376,7 +375,7 @@ async function disconnect() {
 function onGone() {
   ch = null; busy = false;
   $('connect').textContent = '연결'; $('connect').classList.add('main');
-  if (!$('status').classList.contains('err')) say('연결 안 됨. ' + tagStat);
+  if (!$('status').classList.contains('err')) say('연결 안 됨.');
 }
 $('connect').onclick = () => ch ? disconnect() : connect();
 
@@ -387,9 +386,12 @@ function setLevel() {
 $('level').onchange = setLevel;
 $('level').oninput = () => { $('levelv').textContent = $('level').value; };
 
+// Frames a second right now: what went out over the last second. A stored animation is played by the tag
+// itself, which redraws the matrix 60 times a second (its crossfade), so that is the figure shown for it.
 setInterval(() => {
-  $('stat').textContent = ch ? `보낸 화면 ${sent}장, 평균 초당 ${(sent / ((performance.now() - t0) / 1000)).toFixed(1)}장` : tagStat;
-}, 500);
+  const fps = sent - sentAt; sentAt = sent;
+  $('stat').textContent = 'FPS ' + (!ch ? '-' : sheet && !sheetStream ? 60 : fps);
+}, 1000);
 window.addEventListener('resize', paint);
 paint();
 </script>
